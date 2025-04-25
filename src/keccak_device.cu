@@ -1,9 +1,11 @@
 #include "keccak.hpp"
 #include <cstring>
+#include <cstdio>
 
-// The initial 0xff byte followed by deployer (20B) + pre-allocated space for salt (32B) + initHash (32B)
-extern __constant__ uint8_t template85[136];
+// The initial 0xff byte followed by deployer (20B) + pre‑allocated space for salt (32B) + initHash (32B)
+extern __constant__ uint64_t template85[17];
 
+/*
 __constant__ uint64_t RC[24] = {
   0x0000000000000001ULL, 0x0000000000008082ULL, 0x800000000000808aULL, 0x8000000080008000ULL,
   0x000000000000808bULL, 0x0000000080000001ULL, 0x8000000080008081ULL, 0x8000000000008009ULL,
@@ -12,121 +14,156 @@ __constant__ uint64_t RC[24] = {
   0x8000000000008002ULL, 0x8000000000000080ULL, 0x000000000000800aULL, 0x800000008000000aULL,
   0x8000000080008081ULL, 0x8000000000008080ULL, 0x0000000080000001ULL, 0x8000000080008008ULL
 };
+*/
 
-// safe 64‑bit rotate‑left (handles r==0 cleanly)
-inline __device__ __host__
-uint64_t rotl64(uint64_t v, unsigned r) {
-    return (v << (r & 63)) | (v >> ((64 - r) & 63));
+__device__ __host__ inline void ROL(uint64_t &x, int r) {
+    if (r == 0) return;
+    x = (x << r) | (x >> (64 - r));
 }
 
-// Keccak round constants must be accessible on device
-__device__ const int KECCAK_R[25] = {
-    0,36,3,41,18,1,44,10,45,2,62,6,43,15,61,28,55,25,21,56,27,20,39,8,14
-};
-
-__host__ __device__ void keccak_f1600_unrolled(State &A) {
+__host__ __device__ void keccak_f1600_unrolled(const State &input, State &output) {
+/*
+        for (int i = 0; i < 25; ++i) {
+            for (int j = 0; j < 8; j++) {
+                printf("%02x", (input[i] >> (8 * j) & 0xFF));
+            }
+            printf(" ");
+        }
+        printf("\n");
+*/
     static const int R[25] = {
-        0, 36,  3, 41, 18,
-        1, 44, 10, 45,  2,
-        62,  6, 43, 15, 61,
-        28, 55, 25, 21, 56,
-        27, 20, 39,  8, 14
+         0,  1, 62, 28, 27,
+        36, 44,  6, 55, 20,
+         3, 10, 43, 25, 39,
+        41, 45, 15, 21,  8,
+        18,  2, 61, 56, 14
     };
 
-    for (int r = 0; r < 24; ++r) {
-        // Θ step
-        uint64_t C[5], D;
+    uint64_t C[5], D[5], B[25], T[5];
+
+    // First round: read from input, write to output
+    // Theta
+    #pragma unroll
+    for (int x = 0; x < 5; ++x) {
+        C[x] = input[x] ^ input[x + 5] ^ input[x + 10] ^ input[x + 15] ^ input[x + 20];
+    }
+    #pragma unroll
+    for (int x = 0; x < 5; ++x) {
+        D[x] = C[(x + 4) % 5] ^ ((C[(x + 1) % 5] << 1) | (C[(x + 1) % 5] >> 63));
+    }
+    // Rho + Pi
+    #pragma unroll
+    for (int i = 0; i < 25; ++i) {
+        int x = i % 5;
+        int y = i / 5;
+        uint64_t v = input[i] ^ D[x];
+        ROL(v, R[i]);
+        int xP = y;
+        int yP = (2 * x + 3 * y) % 5;
+        int j = xP + 5 * yP;
+        B[j] = v;
+    }
+    // Chi
+    #pragma unroll
+    for (int y = 0; y < 25; y += 5) {
+        #pragma unroll
+        for (int x = 0; x < 5; ++x) T[x] = B[y + x];
+        #pragma unroll
+        for (int x = 0; x < 5; ++x) output[y + x] = T[x] ^ ((~T[(x + 1) % 5]) & T[(x + 2) % 5]);
+    }
+    // Iota
+    output[0] ^= RC[0];
+
+    // Rounds 1 to 23: in-place on output
+    #pragma unroll
+    for (int r = 1; r < 24; ++r) {
+        // Theta
+        #pragma unroll
         for (int x = 0; x < 5; ++x) {
-            C[x] = A[x] ^ A[x + 5] ^ A[x + 10] ^ A[x + 15] ^ A[x + 20];
+            C[x] = output[x] ^ output[x + 5] ^ output[x + 10] ^ output[x + 15] ^ output[x + 20];
         }
+        #pragma unroll
         for (int x = 0; x < 5; ++x) {
-            D = C[(x + 4) % 5] ^ ((C[(x + 1) % 5] << 1) | (C[(x + 1) % 5] >> 63));
+            D[x] = C[(x + 4) % 5] ^ ((C[(x + 1) % 5] << 1) | (C[(x + 1) % 5] >> 63));
+            #pragma unroll
             for (int y = 0; y < 25; y += 5) {
-                A[x + y] ^= D;
+                output[x + y] ^= D[x];
             }
         }
-
         // Rho + Pi
-        State B;
+        #pragma unroll
         for (int i = 0; i < 25; ++i) {
             int x = i % 5;
             int y = i / 5;
-            uint64_t v = A[i];
-            v = rotl64(v, R[i]); // rotate by R[x+5*y]
-
-            // Pi mapping: (x, y) → (x' = y, y' = (2x + 3y) mod 5)
+            uint64_t v = output[i];
+            ROL(v, R[i]);
             int xP = y;
             int yP = (2 * x + 3 * y) % 5;
-            int j  = xP + 5 * yP;
+            int j = xP + 5 * yP;
             B[j] = v;
         }
-
-        // χ step
+        // Chi
+        #pragma unroll
         for (int y = 0; y < 25; y += 5) {
-            uint64_t T[5];
-            for (int x = 0; x < 5; ++x) {
-                T[x] = B[y + x];
-            }
-            for (int x = 0; x < 5; ++x) {
-                A[y + x] = T[x] ^ ((~T[(x + 1) % 5]) & T[(x + 2) % 5]);
-            }
+            #pragma unroll
+            for (int x = 0; x < 5; ++x) T[x] = B[y + x];
+            #pragma unroll
+            for (int x = 0; x < 5; ++x) output[y + x] = T[x] ^ ((~T[(x + 1) % 5]) & T[(x + 2) % 5]);
         }
-
-        // ι step
-        A[0] ^= RC[r];
+        // Iota
+        output[0] ^= RC[r];
     }
 }
 
-// Remove __forceinline__ to make function visible to other compilation units
 __device__
 State load_template() {
     State s{};
-    // template[] in constant memory, rate=136 B => 17 lanes
-    const uint64_t *tmpl = reinterpret_cast<const uint64_t*>(template85);
     #pragma unroll
-    for(int i=0; i<17; i++) s[i] = tmpl[i];
-    // rest are zero by default
+    for(int i = 0; i < 17; i++) {
+        s[i] = template85[i];
+    }
+    // remaining lanes are already zero
     return s;
 }
 
-// Remove __forceinline__ to make function visible to other compilation units
+/*
 __device__
 void put_salt(State &s, uint64_t salt_lo, uint64_t salt_hi) {
-    // bytes 21–52 cover lanes 2‒4 (partial)
-    // assume little-endian: lane2 ^= salt_lo, lane3 ^= salt_hi
+    // bytes 21–52 cover lanes 2‒3
     s[2] ^= salt_lo;
     s[3] ^= salt_hi;
-}
+} */
 
-// Host-side wrapper that handles GPU device calls
 std::array<uint8_t,20> create2_address_gpu(const uint8_t deployer[20],
                                            const uint8_t salt[32],
                                            const uint8_t initHash[32]) {
-    // Create a host-side version that mimics the device-side processing
+    // print salt
+    printf("salt: ");
+    for (int i = 0; i < 32; i++) {
+        printf("%02x", salt[i]);
+    }
+    printf("\n");
+
+    // Host‐side mimic of device pipeline
     State s{};
-    
-    // Manually load template-like data
     uint8_t buf[136] = {0};
     buf[0] = 0xff;
-    memcpy(buf+1, deployer, 20);
-    memcpy(buf+21, salt, 32);
-    memcpy(buf+53, initHash, 32);
-    buf[85]      = 0x01;    // start-of-pad
-    buf[135]    |= 0x80;    // end-of-pad 
-    
-    // Convert to lanes and load into state
-    uint64_t* s_ptr = reinterpret_cast<uint64_t*>(s.data());
-    const uint64_t* buf_ptr = reinterpret_cast<const uint64_t*>(buf);
-    for(int i=0; i<17; i++) {
-        s_ptr[i] = buf_ptr[i];
+    memcpy(buf + 1, deployer, 20);
+    memcpy(buf + 21, salt,    32);
+    memcpy(buf + 53, initHash,32);
+    buf[85]      = 0x01;
+    buf[135]    |= 0x80;
+
+    uint64_t* s_ptr   = reinterpret_cast<uint64_t*>(s.data());
+    const uint64_t* b = reinterpret_cast<const uint64_t*>(buf);
+    for (int i = 0; i < 17; i++) {
+        s_ptr[i] = b[i];
     }
-    
-    // Process
-    keccak_f1600_unrolled(s);
-    
-    // Extract address
+
+    keccak_f1600_unrolled(s, s);
+
     std::array<uint8_t,20> out;
-    uint8_t *p = reinterpret_cast<uint8_t*>(s.data());
-    memcpy(out.data(), p+12, 20);
+    uint8_t* p = reinterpret_cast<uint8_t*>(s.data());
+    memcpy(out.data(), p + 12, 20);
     return out;
 }

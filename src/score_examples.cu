@@ -15,8 +15,9 @@ int32_t score_lz(const U160 &addr) {
     return cnt;
 }
 
-ScoreFn pick_score(const std::string &s) {
-    if (s == "lz") return score_lz;
-    // add more here...
-    return score_lz;
+// Host helper: map string to integer mode
+int pick_score_mode(const std::string &s) {
+    if (s == "lz") return 0;
+    // add more modes here...
+    return 0;
 }

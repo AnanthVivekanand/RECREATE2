@@ -11,7 +11,7 @@ FetchContent_MakeAvailable(argparse)
 
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CUDA_STANDARD 20)
-set(CMAKE_CUDA_ARCHITECTURES 86 89 90)
+set(CMAKE_CUDA_ARCHITECTURES 89) # 70 86 89 90)
 
 # core library
 add_library(core STATIC

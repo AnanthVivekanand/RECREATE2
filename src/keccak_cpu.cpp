@@ -11,7 +11,7 @@ std::array<uint8_t,32> keccak256_cpu(const uint8_t* data, size_t len){
     buf[135] |= 0x80;
     // XOR into state lanes
     memcpy(A.data(), buf, 136);
-    keccak_f1600_unrolled(A);
+    keccak_f1600_unrolled(A, A);
     // squeeze
     std::array<uint8_t,32> out;
     memcpy(out.data(), reinterpret_cast<uint8_t*>(A.data())+0, 32);
