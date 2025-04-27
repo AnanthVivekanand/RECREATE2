@@ -60,26 +60,23 @@ __global__ void mine(uint64_t start,
                gid, start, step, target);
     }
 
-    State res{};
-    State base = load_template();
-
-    // load high salt into template
-    uint8_t* s8 = reinterpret_cast<uint8_t*>(&base);
-    for (int i = 0; i < 8; i++) {
-        s8[44 - i] = (salt_hi >> (8 * i)) & 0xff;
-    }
-
     while (true) {
         if (*device_should_exit != 0) {
             break;
         }
 
+        State base = load_template();
+        uint8_t* s8 = reinterpret_cast<uint8_t*>(&base);
+
         for (int i = 0; i < 8; i++) {
             s8[52 - i] = (salt_lo >> (8 * i)) & 0xff;
         }
+        for (int i = 0; i < 8; i++) {
+            s8[44 - i] = (salt_hi >> (8 * i)) & 0xff;
+        }
 
-        keccak_f1600_unrolled(base, res);
-        U160 addr = tail20bytes(res);
+        keccak_f1600_unrolled(base, base);
+        U160 addr = tail20bytes(base);
         int32_t sc = score_lz(addr);
 
         localCount++;
