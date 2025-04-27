@@ -14,19 +14,9 @@
 // first 136 bytes of the Keccak rate block
 __constant__ uint64_t template85[17];
 
-// extract bytes 12–31 from the 200-byte sponge output
 __device__ __forceinline__
-U160 tail20bytes(const State &s) {
-    U160 out;
-    const uint8_t* ptr = reinterpret_cast<const uint8_t*>(&s);
-    for (int i = 0; i < 20; i++) {
-        out[i] = ptr[12 + i];
-    }
-    return out;
-}
-
-__device__ __forceinline__
-int32_t score_lz(const U160 &addr) {
+int32_t score_state_directly(const State &s) {
+    const uint8_t* addr = (reinterpret_cast<const uint8_t*>(&s)) + 12;
     int32_t sc = 0;
     for (int i = 0; i < 20; i++) {
         if (addr[i] == 0) {
@@ -60,24 +50,25 @@ __global__ void mine(uint64_t start,
                gid, start, step, target);
     }
 
+    State base = load_template();
+    State res{};
+
+    uint8_t* s8 = reinterpret_cast<uint8_t*>(&base);
+    for (int i = 0; i < 8; i++) {
+        s8[44 - i] = (salt_hi >> (8 * i)) & 0xff;
+    }
+
     while (true) {
         if (*device_should_exit != 0) {
             break;
         }
 
-        State base = load_template();
-        uint8_t* s8 = reinterpret_cast<uint8_t*>(&base);
-
         for (int i = 0; i < 8; i++) {
             s8[52 - i] = (salt_lo >> (8 * i)) & 0xff;
         }
-        for (int i = 0; i < 8; i++) {
-            s8[44 - i] = (salt_hi >> (8 * i)) & 0xff;
-        }
 
-        keccak_f1600_unrolled(base, base);
-        U160 addr = tail20bytes(base);
-        int32_t sc = score_lz(addr);
+        keccak_f1600_unrolled(base, res);
+        int32_t sc = score_state_directly(res);
 
         localCount++;
         if (localCount == LOG_INTERVAL) {
