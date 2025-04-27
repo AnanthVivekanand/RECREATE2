@@ -54,6 +54,8 @@ KDEV void put_salt(State &s, uint64_t salt_lo, uint64_t salt_hi = 0);
 // full 24‑round unrolled Keccak‑f[1600], available on both host and device
 __host__ __device__ void keccak_f1600_unrolled(const State &s, State &t);
 
+void keccak_f1600_cpu(const State &input, State &output);
+
 // CPU helpers (for testing path)
 std::array<uint8_t,32> keccak256_cpu(const uint8_t *data, size_t len);
 

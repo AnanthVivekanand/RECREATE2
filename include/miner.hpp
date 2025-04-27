@@ -4,10 +4,12 @@
 #include <string>
 #include "keccak.hpp"
 
+#ifdef HAVE_MPI
+#include <mpi.h>
+#endif
+
 using U160    = std::array<uint8_t,20>;
 using ScoreFn = int32_t(*)(const U160&);
-
-int pick_score_mode(const std::string &s);
 
 struct salt_result {
     uint64_t salt_lo;
@@ -37,7 +39,17 @@ __global__ void mine(uint64_t start,
 #endif
 
 // Host‐side launcher
+#ifdef HAVE_CUDA
 void run_kernel(const LaunchCfg& cfg,
                 uint32_t blocks,
-                uint32_t threads);
+                uint32_t threads,
+                bool use_mpi,
+                int rank,
+                int size);
+#endif
 
+void run_cpu_mining(const LaunchCfg& cfg,
+                    uint32_t num_threads,
+                    bool use_mpi,
+                    int rank,
+                    int size);

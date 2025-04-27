@@ -16,13 +16,17 @@ int main() {
     auto init_hash   = hex_to_bytes<32>(initcode_hash_str);
 
     // Compute CREATE2 address on GPU and CPU
+#ifdef HAVE_CUDA
     auto addr_gpu    = create2_address_gpu(deployer.data(), salt.data(), init_hash.data());
+#endif
     auto addr_cpu    = create2_address_cpu(deployer.data(), salt.data(), init_hash.data());
 
+#ifdef HAVE_CUDA
     // Verify both implementations match
     assert(addr_gpu == addr_cpu);
+#endif
 
     // Print the computed address
-    std::cout << "CREATE2 computed address: 0x" << to_hex(addr_gpu) << std::endl;
+    std::cout << "CREATE2 computed address: 0x" << to_hex(addr_cpu) << std::endl;
     return 0;
 }

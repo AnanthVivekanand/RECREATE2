@@ -51,13 +51,9 @@ __global__ void mine(uint64_t start,
                      volatile int* device_should_exit)
 {
     uint32_t gid = blockIdx.x * blockDim.x + threadIdx.x;
-    uint64_t salt_lo = start + gid;
+    uint64_t salt_hi = ((start + gid) << 32) | (uint64_t(deviceIdx) << 52);
+    uint64_t salt_lo = 0;
     uint64_t localCount = 0;
-
-    curandState randState;
-    uint64_t seed = (uint64_t(deviceIdx) << 32) | gid;
-    curand_init(seed, 0, 0, &randState);
-    uint64_t salt_hi = curand(&randState);
 
     if (gid % 1000 == 0) {
         printf("[DBG] thread %d, start=%llu, step=%llu, target=%llu\n",
@@ -73,7 +69,7 @@ __global__ void mine(uint64_t start,
         s8[44 - i] = (salt_hi >> (8 * i)) & 0xff;
     }
 
-    for (;; salt_lo += step) {
+    while (true) {
         if (*device_should_exit != 0) {
             break;
         }
@@ -86,29 +82,11 @@ __global__ void mine(uint64_t start,
         U160 addr = tail20bytes(res);
         int32_t sc = score_lz(addr);
 
-/*
-        printf("[DBG] thread %d, salt_lo=%016llx, salt_hi=%016llx, score=%d\n",
-               gid, salt_lo, salt_hi, sc);
-        printf("Score is %d\n", sc);
-
-        // print address
-        if (sc >= 12) {
-            for (int i = 0; i < 20; i++) {
-                printf("%02x", addr[i]);
-            }
-            printf("\n");
-        }
-*/
-
         localCount++;
         if (localCount == LOG_INTERVAL) {
             atomicAdd((unsigned long long*)&perfCounters[blockIdx.x],
                       (unsigned long long)localCount);
             localCount = 0;
-            if (gid == 0) {
-                /* printf("[DBG] GPU %d, thread %d exiting at log interval, device_should_exit=%d\n",
-                   deviceIdx, gid, *device_should_exit); */
-            }
             if (*device_should_exit != 0) {
                 break;
             }
@@ -117,7 +95,6 @@ __global__ void mine(uint64_t start,
         if (sc >= int32_t(target)) {
             printf("[DBG] thread %d, salt_lo=%016llx, salt_hi=%016llx, score=%d\n",
                    gid, salt_lo, salt_hi, sc);
-            // if (atomicExch(device_should_exit, 1) == 0) {
             if (*device_should_exit == 0) {
                 out->score = sc;
                 out->salt_lo = salt_lo;
@@ -126,6 +103,7 @@ __global__ void mine(uint64_t start,
                 break;
             }
         }
+        salt_lo += 1;
     }
 
     if (localCount) {
@@ -134,15 +112,15 @@ __global__ void mine(uint64_t start,
     }
 }
 
-
 void run_kernel(const LaunchCfg& cfg,
                 uint32_t blocks,
-                uint32_t threads)
+                uint32_t threads,
+                bool use_mpi,
+                int rank,
+                int size)
 {
     int num_gpus;
     cudaGetDeviceCount(&num_gpus);
-
-    // num_gpus = 1;
 
     if (num_gpus < 1) {
         std::cerr << "[ERR] No CUDA-capable devices found.\n";
@@ -197,7 +175,6 @@ void run_kernel(const LaunchCfg& cfg,
                    i, maxPerSM, prop.multiProcessorCount);
         }
 
-
         cudaDeviceSetLimit(cudaLimitPrintfFifoSize, 10*1024*1024);
         
         GPUContext& ctx = contexts[i];
@@ -208,7 +185,6 @@ void run_kernel(const LaunchCfg& cfg,
 
         cudaMalloc(&ctx.d_best, sizeof(salt_result));
         cudaMemset(ctx.d_best, 0, sizeof(salt_result));
-
 
         cudaMalloc(&ctx.d_perfCounters, blocks * sizeof(uint64_t));
         cudaMemset(ctx.d_perfCounters, 0, blocks * sizeof(uint64_t));
@@ -227,9 +203,6 @@ void run_kernel(const LaunchCfg& cfg,
 
         cudaStreamCreateWithFlags(&ctx.copyStream, cudaStreamNonBlocking);
 
-        // blocks = 1;
-        // threads = 1;
-
         std::cout << "[INFO] GPU " << i << ": Launching mine<<<" << blocks
                   << "," << threads << ">>> (" << uint64_t(blocks)*threads
                   << " threads)\n";
@@ -241,7 +214,6 @@ void run_kernel(const LaunchCfg& cfg,
             cfg.scoreMode,
             ctx.d_best,
             ctx.d_perfCounters,
-            // ctx.clockRate,
             i,  // deviceIdx
             ctx.d_should_exit
         );
@@ -253,11 +225,22 @@ void run_kernel(const LaunchCfg& cfg,
         }
     }
 
-
     // Polling loop
     std::vector<uint64_t> lastTotals(num_gpus, 0);
     auto t0 = std::chrono::high_resolution_clock::now();
     bool done = false;
+    
+#ifdef HAVE_MPI
+    int global_should_exit = 0;
+    MPI_Request stop_request;
+#endif
+    int stop_flag = 0;
+#ifdef HAVE_MPI
+    if (use_mpi) {
+        MPI_Irecv(&global_should_exit, 1, MPI_INT, MPI_ANY_SOURCE, 1, MPI_COMM_WORLD, &stop_request);
+    }
+#endif
+
     while (!done) {
         std::this_thread::sleep_for(std::chrono::seconds(2));
         for (int i = 0; i < num_gpus; i++) {
@@ -290,8 +273,28 @@ void run_kernel(const LaunchCfg& cfg,
             uint32_t score = result.score;
             if (score >= cfg.target) {
                 should_exit = 1;
+                if (use_mpi && !stop_flag) {
+#ifdef HAVE_MPI
+                    for (int r = 0; r < size; r++) {
+                        if (r != rank) {
+                            MPI_Send(&should_exit, 1, MPI_INT, r, 1, MPI_COMM_WORLD);
+                        }
+                    }
+#endif
+                    stop_flag = 1;
+                }
             }
         }
+
+#ifdef HAVE_MPI
+        if (use_mpi) {
+            MPI_Test(&stop_request, &global_should_exit, MPI_STATUS_IGNORE);
+            if (global_should_exit) {
+                should_exit = 1;
+            }
+        }
+#endif
+
         t0 = std::chrono::high_resolution_clock::now();
         if (should_exit) done = true;
     }
@@ -340,6 +343,20 @@ void run_kernel(const LaunchCfg& cfg,
     uint64_t bestSaltHi  = best_result.salt_hi;
     printf("[INFO] Best salt: 0x%016llx%016llx, score: %d\n",
            bestSaltHi, bestSaltLo, bestScore);
+
+#ifdef HAVE_MPI
+    if (use_mpi) {
+        struct { uint32_t score; int rank; } local_best = {bestScore, rank};
+        struct { uint32_t score; int rank; } global_best;
+        MPI_Reduce(&local_best, &global_best, 1, MPI_2INT, MPI_MAXLOC, 0, MPI_COMM_WORLD);
+        if (rank == 0) {
+            if (global_best.rank != rank) {
+                printf("[INFO] Best result from rank %d with score %d\n", global_best.rank, global_best.score);
+            }
+        }
+        MPI_Barrier(MPI_COMM_WORLD);
+    }
+#endif
 
     std::array<uint8_t,32> saltArr{};
     for (int i = 0; i < 8; ++i) {

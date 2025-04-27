@@ -1,33 +1,39 @@
 #include "keccak.hpp"
 #include <cstring>
+#include <cstdio>
 
-// very minimal CPU keccak256 (one-block, sponge padding)
-std::array<uint8_t,32> keccak256_cpu(const uint8_t* data, size_t len){
-    State A{}; // zero
-    // absorb up to 136 B
+std::array<uint8_t,20> create2_address_cpu(const uint8_t deployer[20],
+                                           const uint8_t salt[32],
+                                           const uint8_t initHash[32]){
+    
+    // print salt
+    printf("salt: ");
+    for (int i = 0; i < 32; i++) {
+        printf("%02x", salt[i]);
+    }
+    printf("\n");
+
+
+    State s{};
+
     uint8_t buf[136] = {0};
-    memcpy(buf, data, len);
-    buf[len] = 0x01;
-    buf[135] |= 0x80;
-    // XOR into state lanes
-    memcpy(A.data(), buf, 136);
-    keccak_f1600_unrolled(A, A);
-    // squeeze
-    std::array<uint8_t,32> out;
-    memcpy(out.data(), reinterpret_cast<uint8_t*>(A.data())+0, 32);
-    return out;
-}
+    buf[0] = 0xff;
+    memcpy(buf + 1, deployer, 20);
+    memcpy(buf + 21, salt,    32);
+    memcpy(buf + 53, initHash,32);
+    buf[85]      = 0x01;
+    buf[135]    |= 0x80;
 
-std::array<uint8_t,20> create2_address_cpu(const uint8_t d[20],
-                                           const uint8_t s[32],
-                                           const uint8_t h[32]){
-    uint8_t buf[1+20+32+32];
-    buf[0]=0xff;
-    memcpy(buf+1, d,20);
-    memcpy(buf+1+20,s,32);
-    memcpy(buf+1+20+32,h,32);
-    auto hash = keccak256_cpu(buf,sizeof(buf));
+    uint64_t* s_ptr   = reinterpret_cast<uint64_t*>(s.data());
+    const uint64_t* b = reinterpret_cast<const uint64_t*>(buf);
+    for (int i = 0; i < 17; i++) {
+        s_ptr[i] = b[i];
+    }
+
+    keccak_f1600_cpu(s, s);
+
     std::array<uint8_t,20> out;
-    memcpy(out.data(), hash.data()+12,20);
+    uint8_t* p = reinterpret_cast<uint8_t*>(s.data());
+    memcpy(out.data(), p + 12, 20);
     return out;
 }
