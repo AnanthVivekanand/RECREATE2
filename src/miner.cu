@@ -19,6 +19,7 @@ __device__ __forceinline__
 U160 tail20bytes(const State &s) {
     U160 out;
     const uint8_t* ptr = reinterpret_cast<const uint8_t*>(&s);
+    #pragma unroll
     for (int i = 0; i < 20; i++) {
         out[i] = ptr[12 + i];
     }
@@ -28,6 +29,7 @@ U160 tail20bytes(const State &s) {
 __device__ __forceinline__
 int32_t score_lz(const U160 &addr) {
     int32_t sc = 0;
+    #pragma unroll
     for (int i = 0; i < 20; i++) {
         if (addr[i] == 0) {
             sc += 8;
@@ -68,9 +70,11 @@ __global__ void mine(uint64_t start,
         State base = load_template();
         uint8_t* s8 = reinterpret_cast<uint8_t*>(&base);
 
+        #pragma unroll
         for (int i = 0; i < 8; i++) {
             s8[52 - i] = (salt_lo >> (8 * i)) & 0xff;
         }
+        #pragma unroll
         for (int i = 0; i < 8; i++) {
             s8[44 - i] = (salt_hi >> (8 * i)) & 0xff;
         }
