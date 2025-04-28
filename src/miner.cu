@@ -15,30 +15,45 @@
 __constant__ uint64_t template85[17];
 
 // extract bytes 12–31 from the 200-byte sponge output
-__device__ __forceinline__
-U160 tail20bytes(const State &s) {
-    U160 out;
-    const uint8_t* ptr = reinterpret_cast<const uint8_t*>(&s);
-    for (int i = 0; i < 20; i++) {
-        out[i] = ptr[12 + i];
-    }
-    return out;
-}
+__device__ 
+int32_t score_lz(const State &s) {
+    const uint8_t* ptr = reinterpret_cast<const uint8_t*>(&s) + 12;
 
-__device__ __forceinline__
-int32_t score_lz(const U160 &addr) {
-    int32_t sc = 0;
-    for (int i = 0; i < 20; i++) {
-        if (addr[i] == 0) {
-            sc += 8;
-        } else if (addr[i] <= 0x0F) {
-            sc += 4;
-            break;
-        } else {
-            break;
-        }
+    uint32_t w0 = (uint32_t(ptr[0]) << 24)
+                | (uint32_t(ptr[1]) << 16)
+                | (uint32_t(ptr[2]) <<  8)
+                | (uint32_t(ptr[3]));
+    if (w0 != 0) {
+        return __builtin_clz(w0);
     }
-    return sc;
+    int32_t lz = 32;
+
+    uint64_t w1 = (uint64_t(ptr[4]) << 56)
+                | (uint64_t(ptr[5]) << 48)
+                | (uint64_t(ptr[6]) << 40)
+                | (uint64_t(ptr[7]) << 32)
+                | (uint64_t(ptr[8]) << 24)
+                | (uint64_t(ptr[9]) << 16)
+                | (uint64_t(ptr[10])<<  8)
+                | (uint64_t(ptr[11]));
+    if (w1 != 0) {
+        return lz + __builtin_clzll(w1);
+    }
+    lz += 64;
+
+    uint64_t w2 = (uint64_t(ptr[12]) << 56)
+                | (uint64_t(ptr[13]) << 48)
+                | (uint64_t(ptr[14]) << 40)
+                | (uint64_t(ptr[15]) << 32)
+                | (uint64_t(ptr[16]) << 24)
+                | (uint64_t(ptr[17]) << 16)
+                | (uint64_t(ptr[18]) <<  8)
+                | (uint64_t(ptr[19]));
+    if (w2 != 0) {
+        return lz + __builtin_clzll(w2);
+    }
+
+    return lz + 64;
 }
 
 __global__ void mine(uint64_t start,
@@ -76,8 +91,7 @@ __global__ void mine(uint64_t start,
         }
 
         keccak_f1600_unrolled(base, base);
-        U160 addr = tail20bytes(base);
-        int32_t sc = score_lz(addr);
+        int32_t sc = score_lz(base);
 
         localCount++;
         if (localCount == LOG_INTERVAL) {

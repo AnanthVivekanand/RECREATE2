@@ -43,7 +43,12 @@ if (CUDA_FOUND)
         CUDA_SEPARABLE_COMPILATION ON
     )
     target_compile_options(core PRIVATE
-        $<$<COMPILE_LANGUAGE:CUDA>:--use_fast_math --expt-relaxed-constexpr>
+        $<$<COMPILE_LANGUAGE:CUDA>:
+        --use_fast_math 
+        --expt-relaxed-constexpr
+        -keep                # keep all intermediates
+        -Xptxas -v           # verbose ptxas stats
+        --keep-dir ${CMAKE_BINARY_DIR}/cuda_build> 
     )
 endif()
 
