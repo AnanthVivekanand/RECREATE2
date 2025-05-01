@@ -21,12 +21,15 @@ int main() {
 #endif
     auto addr_cpu    = create2_address_cpu(deployer.data(), salt.data(), init_hash.data());
 
+    // Print the computed address
+    std::cout << "CREATE2 computed address (CPU): 0x" << to_hex(addr_cpu) << std::endl;
+
 #ifdef HAVE_CUDA
     // Verify both implementations match
+    std::cout << "CREATE2 computed address (GPU): 0x" << to_hex(addr_gpu) << std::endl;
     assert(addr_gpu == addr_cpu);
 #endif
 
-    // Print the computed address
-    std::cout << "CREATE2 computed address: 0x" << to_hex(addr_cpu) << std::endl;
+
     return 0;
 }
