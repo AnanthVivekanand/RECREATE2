@@ -1,3 +1,13 @@
 build/
 output.txt
 .vscode/
+
+CMakeCache.txt
+CMakeFiles/
+CPackConfig.cmake
+CPackSourceConfig.cmake
+_deps/
+cmake_install.cmake
+create2_miner
+*.a
+tests

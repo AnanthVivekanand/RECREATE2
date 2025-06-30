@@ -1,10 +1,13 @@
 #include <iostream>
 #include <vector>
 #include <thread>
-#include <mpi.h>
 #include <argparse/argparse.hpp>
 #include "miner.hpp"
 #include "util.hpp"
+
+#ifdef HAVE_MPI
+#include <mpi.h>
+#endif
 
 int main(int argc, char** argv)
 {
@@ -77,9 +80,11 @@ int main(int argc, char** argv)
         return 1;
     }
 
+#ifdef HAVE_MPI
     if (use_mpi) {
         MPI_Finalize();
     }
+#endif
 
     return 0;
 }

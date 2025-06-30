@@ -1,4 +1,4 @@
-cmake_minimum_required(VERSION 3.24)
+cmake_minimum_required(VERSION 3.22)
 project(create2_miner LANGUAGES CXX)
 
 find_package(MPI)
