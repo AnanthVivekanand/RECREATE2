@@ -62,6 +62,7 @@ __global__ void mine(uint64_t start,
 
     State res{};
     State base = load_template();
+    int32_t sc = 0;
 
     // load high salt into template
     uint8_t* s8 = reinterpret_cast<uint8_t*>(&base);
@@ -69,6 +70,7 @@ __global__ void mine(uint64_t start,
         s8[44 - i] = (salt_hi >> (8 * i)) & 0xff;
     }
 
+    #pragma unroll 5
     while (true) {
         if (*device_should_exit != 0) {
             break;
@@ -79,8 +81,6 @@ __global__ void mine(uint64_t start,
         }
 
         keccak_f1600_unrolled(base, res);
-        U160 addr = tail20bytes(res);
-        int32_t sc = score_lz(addr);
 
         localCount++;
         if (localCount == LOG_INTERVAL) {
@@ -92,7 +92,8 @@ __global__ void mine(uint64_t start,
             }
         }
 
-        if (sc >= int32_t(target)) {
+        if (score_lz(tail20bytes(res)) >= int32_t(target)) {
+            sc = score_lz(tail20bytes(res));
             printf("[DBG] thread %d, salt_lo=%016llx, salt_hi=%016llx, score=%d\n",
                    gid, salt_lo, salt_hi, sc);
             if (*device_should_exit == 0) {
@@ -366,8 +367,59 @@ void run_kernel(const LaunchCfg& cfg,
         bestSaltHi >>= 8;
     }
     std::cout << "\n";
-    auto addr = create2_address_gpu(
+    auto addr = create2_address_cpu(
         cfg.deployer, saltArr.data(), cfg.initHash
     );
-    std::cout << "Address: 0x" << to_hex(addr) << std::endl;
+    auto addr_gpu = create2_address_gpu(
+        cfg.deployer, saltArr.data(), cfg.initHash
+    );
+    std::cout << "Address GPU: 0x" << to_hex(addr_gpu) << std::endl;
+    std::cout << "Address CPU: 0x" << to_hex(addr) << std::endl;
+}
+
+__global__ void keccak_f1600_kernel(State* state) {
+    keccak_f1600_unrolled(*state, *state);
+}
+
+std::array<uint8_t,20> create2_address_gpu(const uint8_t deployer[20],
+                                           const uint8_t salt[32],
+                                           const uint8_t initHash[32]) {
+    // print salt
+    printf("salt: ");
+    for (int i = 0; i < 32; i++) {
+        printf("%02x", salt[i]);
+    }
+    printf("\n");
+
+    // Host‐side mimic of device pipeline
+    State s{};
+    uint8_t buf[136] = {0};
+    buf[0] = 0xff;
+    memcpy(buf + 1, deployer, 20);
+    memcpy(buf + 21, salt,    32);
+    memcpy(buf + 53, initHash,32);
+    buf[85]      = 0x01;
+    buf[135]    |= 0x80;
+
+    uint64_t* s_ptr   = reinterpret_cast<uint64_t*>(s.data());
+    const uint64_t* b = reinterpret_cast<const uint64_t*>(buf);
+    for (int i = 0; i < 17; i++) {
+        s_ptr[i] = b[i];
+    }
+
+    State* d_state = nullptr;
+    cudaMalloc(&d_state, sizeof(State));
+    cudaMemcpy(d_state, &s, sizeof(State), cudaMemcpyHostToDevice);
+
+    // Single-thread, single-block launch is enough for one hash
+    keccak_f1600_kernel<<<1, 1>>>(d_state);
+    cudaDeviceSynchronize();
+
+    cudaMemcpy(&s, d_state, sizeof(State), cudaMemcpyDeviceToHost);
+    cudaFree(d_state);
+
+    std::array<uint8_t,20> out;
+    uint8_t* p = reinterpret_cast<uint8_t*>(s.data());
+    memcpy(out.data(), p + 12, 20);
+    return out;
 }

@@ -4,6 +4,7 @@
 #include <argparse/argparse.hpp>
 #include "miner.hpp"
 #include "util.hpp"
+#include "benchmark.hpp"
 
 #ifdef HAVE_MPI
 #include <mpi.h>
@@ -12,18 +13,32 @@
 int main(int argc, char** argv)
 {
     argparse::ArgumentParser p("create2_miner");
-    p.add_argument("--deployer").required();
-    p.add_argument("--init-hash").required();
+    p.add_argument("--deployer");
+    p.add_argument("--init-hash");
     p.add_argument("--score").default_value(0);   // leading‑zeros
     p.add_argument("--threshold").default_value(32).scan<'i',int>();
     p.add_argument("--threads").default_value(0).scan<'i',int>();
     p.add_argument("--blocks").scan<'i',int>();       // optional override
     p.add_argument("--test-salt");
-    p.add_argument("--device").required().default_value("gpu").help("Device type: gpu or cpu");
+    p.add_argument("--device").default_value("gpu").help("Device type: gpu or cpu");
     p.add_argument("--mpi").default_value(false).implicit_value(true).help("Enable MPI for distributed computing");
+    p.add_argument("--benchmark").default_value(false).implicit_value(true).help("Run benchmark mode with built-in test values");
     p.parse_args(argc, argv);
 
-    auto dep  = hex_to_bytes<20>(p.get("--deployer"));
+    bool benchmark_mode = p.get<bool>("--benchmark");
+    
+    if (benchmark_mode) {
+        std::string device = p.get<std::string>("--device");
+        run_benchmark(device);
+        return 0;
+    }
+    
+    if (!p.present("--deployer") || !p.present("--init-hash")) {
+        std::cerr << "[ERR] --deployer and --init-hash are required in normal mode\n";
+        return 1;
+    }
+    
+    auto dep = hex_to_bytes<20>(p.get("--deployer"));
     auto init = hex_to_bytes<32>(p.get("--init-hash"));
 
     // single‑shot test mode

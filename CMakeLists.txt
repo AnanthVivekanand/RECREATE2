@@ -14,7 +14,7 @@ if (CUDA_FOUND)
     enable_language(CUDA)
     add_definitions(-DHAVE_CUDA)
     set(CMAKE_CUDA_STANDARD 20)
-    set(CMAKE_CUDA_ARCHITECTURES 70)
+    set(CMAKE_CUDA_ARCHITECTURES 90)
 else()
     message(WARNING "CUDA not found. GPU support will be disabled.")
 endif()
@@ -32,6 +32,7 @@ set(CMAKE_CXX_STANDARD 20)
 add_library(core STATIC
   src/miner_cpu.cpp
   src/keccak_cpu.cpp
+  src/benchmark.cpp
 )
 
 if (CUDA_FOUND)
@@ -43,8 +44,9 @@ if (CUDA_FOUND)
         CUDA_SEPARABLE_COMPILATION ON
     )
     target_compile_options(core PRIVATE
-        $<$<COMPILE_LANGUAGE:CUDA>:--use_fast_math --expt-relaxed-constexpr>
-    )
+        $<$<COMPILE_LANGUAGE:CUDA>:--use_fast_math --expt-relaxed-constexpr
+                                           --keep --keep-dir=${CMAKE_BINARY_DIR}/ptx
+                                           -Xptxas -v> )
 endif()
 
 target_compile_options(core PRIVATE
