@@ -22,6 +22,7 @@ int main(int argc, char** argv)
     p.add_argument("--threads").default_value(0).scan<'i',int>();
     p.add_argument("--blocks").scan<'i',int>();       // optional override
     p.add_argument("--test-salt");
+    p.add_argument("--prefix").help("Mine for address with this hex prefix (e.g. 0xC0FFEE)");
     p.add_argument("--device").default_value("gpu").help("Device type: gpu or cpu");
     p.add_argument("--mpi").default_value(false).implicit_value(true).help("Enable MPI for distributed computing");
     p.add_argument("--benchmark").default_value(false).implicit_value(true).help("Run benchmark mode with built-in test values");
@@ -31,7 +32,9 @@ int main(int argc, char** argv)
     
     if (benchmark_mode) {
         std::string device = p.get<std::string>("--device");
-        run_benchmark(device);
+        bool c3 = p.get<bool>("--create3");
+        bool use_prefix = p.present("--prefix").has_value();
+        run_benchmark(device, c3, use_prefix);
         return 0;
     }
     
@@ -73,6 +76,24 @@ int main(int argc, char** argv)
     cfg.initHash  = init.data();
     cfg.step      = 1;
     cfg.create3   = create3_mode;
+
+    if (p.present("--prefix")) {
+        std::string prefix_str = p.get("--prefix");
+        if (prefix_str.size() >= 2 && prefix_str[0] == '0' && prefix_str[1] == 'x')
+            prefix_str = prefix_str.substr(2);
+        cfg.prefixNibbles = prefix_str.size();
+        if (cfg.prefixNibbles > 40) {
+            std::cerr << "[ERR] Prefix too long (max 40 hex chars)\n";
+            return 1;
+        }
+        for (int i = 0; i < cfg.prefixNibbles; i += 2) {
+            uint8_t hi = hex_char(prefix_str[i]);
+            uint8_t lo = (i + 1 < cfg.prefixNibbles) ? hex_char(prefix_str[i + 1]) : 0;
+            cfg.prefixBytes[i / 2] = (hi << 4) | lo;
+        }
+        cfg.target = cfg.prefixNibbles;
+        std::cout << "[INFO] Mining for prefix: 0x" << prefix_str << " (" << cfg.prefixNibbles << " nibbles)\n";
+    }
 
     if (create3_mode) {
         std::cout << "[INFO] CREATE3 mode enabled (Solady proxy hash)\n";

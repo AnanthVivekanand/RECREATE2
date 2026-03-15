@@ -25,6 +25,8 @@ struct LaunchCfg {
     const uint8_t* deployer = nullptr;   // factory address for CREATE3
     const uint8_t* initHash = nullptr;   // unused for CREATE3 (constant proxy hash)
     bool        create3   = false;
+    uint8_t     prefixBytes[20] = {};
+    int         prefixNibbles   = 0;     // 0 = leading-zero scoring mode
 };
 
 // Solady CREATE3 proxy initcode hash (constant across all Solady factories)

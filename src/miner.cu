@@ -8,11 +8,19 @@
 #include <thread>
 #include <curand_kernel.h>
 #include <vector>
+#include <ctime>
 
 #define LOG_INTERVAL 5000
 
 // first 136 bytes of the Keccak rate block
 __constant__ uint64_t template85[17];
+
+// prefix matching data (set from host)
+__constant__ uint8_t d_prefix[20];
+__constant__ int d_prefix_nibbles;
+
+// epoch for run uniqueness (set from host)
+__constant__ uint32_t d_epoch;
 
 // extract bytes 12–31 from the 200-byte sponge output
 __device__ __forceinline__
@@ -41,6 +49,25 @@ int32_t score_lz(const U160 &addr) {
     return sc;
 }
 
+// Returns score and whether it meets target. Prefix mode if d_prefix_nibbles > 0.
+__device__ __forceinline__
+bool check_match(const U160 &addr, int32_t target, int32_t &out_score) {
+    if (d_prefix_nibbles > 0) {
+        int n = d_prefix_nibbles;
+        int full_bytes = n / 2;
+        for (int i = 0; i < full_bytes; i++) {
+            if (addr[i] != d_prefix[i]) { out_score = 0; return false; }
+        }
+        if (n & 1) {
+            if ((addr[full_bytes] & 0xF0) != (d_prefix[full_bytes] & 0xF0)) { out_score = 0; return false; }
+        }
+        out_score = n;
+        return true;
+    }
+    out_score = score_lz(addr);
+    return out_score >= target;
+}
+
 __global__ void mine(uint64_t start,
                      uint64_t step,
                      uint64_t target,
@@ -51,7 +78,7 @@ __global__ void mine(uint64_t start,
                      volatile int* device_should_exit)
 {
     uint32_t gid = blockIdx.x * blockDim.x + threadIdx.x;
-    uint64_t salt_hi = ((start + gid) << 32) | (uint64_t(deviceIdx) << 52);
+    uint64_t salt_hi = ((start + gid) << 32) | (uint64_t(deviceIdx) << 52) | uint64_t(d_epoch);
     uint64_t salt_lo = 0;
     uint64_t localCount = 0;
 
@@ -92,8 +119,7 @@ __global__ void mine(uint64_t start,
             }
         }
 
-        if (score_lz(tail20bytes(res)) >= int32_t(target)) {
-            sc = score_lz(tail20bytes(res));
+        if (check_match(tail20bytes(res), int32_t(target), sc)) {
             printf("[DBG] thread %d, salt_lo=%016llx, salt_hi=%016llx, score=%d\n",
                    gid, salt_lo, salt_hi, sc);
             if (*device_should_exit == 0) {
@@ -126,7 +152,7 @@ __global__ void mine_create3(uint64_t start,
                              volatile int* device_should_exit)
 {
     uint32_t gid = blockIdx.x * blockDim.x + threadIdx.x;
-    uint64_t salt_hi = ((start + gid) << 32) | (uint64_t(deviceIdx) << 52);
+    uint64_t salt_hi = ((start + gid) << 32) | (uint64_t(deviceIdx) << 52) | uint64_t(d_epoch);
     uint64_t salt_lo = 0;
     uint64_t localCount = 0;
 
@@ -186,8 +212,8 @@ __global__ void mine_create3(uint64_t start,
             if (*device_should_exit != 0) break;
         }
 
-        if (score_lz(tail20bytes(res)) >= int32_t(target)) {
-            int32_t sc = score_lz(tail20bytes(res));
+        int32_t sc;
+        if (check_match(tail20bytes(res), int32_t(target), sc)) {
             printf("[DBG-C3] thread %d, salt_lo=%016llx, salt_hi=%016llx, score=%d\n",
                    gid, salt_lo, salt_hi, sc);
             if (*device_should_exit == 0) {
@@ -237,6 +263,9 @@ void run_kernel(const LaunchCfg& cfg,
     ptr[85]  = 0x01;
     ptr[135] = 0x80;
 
+    uint32_t epoch = (uint32_t)time(nullptr);
+    std::cout << "[INFO] Epoch seed: " << epoch << "\n";
+
     int should_exit = 0;
 
     struct GPUContext {
@@ -257,6 +286,10 @@ void run_kernel(const LaunchCfg& cfg,
             std::cerr << "[ERR] cudaMemcpyToSymbol failed: " << cudaGetErrorString(err) << "\n";
             exit(1);
         }
+
+        cudaMemcpyToSymbol(d_prefix, cfg.prefixBytes, 20);
+        cudaMemcpyToSymbol(d_prefix_nibbles, &cfg.prefixNibbles, sizeof(int));
+        cudaMemcpyToSymbol(d_epoch, &epoch, sizeof(uint32_t));
 
         cudaDeviceProp prop;
         cudaGetDeviceProperties(&prop, i);

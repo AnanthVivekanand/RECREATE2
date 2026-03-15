@@ -9,6 +9,7 @@
 #include <array>
 #include <cstring>
 #include "util.hpp"
+#include <ctime>
 
 #define LOG_INTERVAL 5000
 
@@ -35,6 +36,21 @@ int32_t score_lz(const U160 &addr) {
         }
     }
     return sc;
+}
+
+inline int32_t compute_score(const U160 &addr, const LaunchCfg &cfg) {
+    if (cfg.prefixNibbles > 0) {
+        int n = cfg.prefixNibbles;
+        int full_bytes = n / 2;
+        for (int i = 0; i < full_bytes; i++) {
+            if (addr[i] != cfg.prefixBytes[i]) return 0;
+        }
+        if (n & 1) {
+            if ((addr[full_bytes] & 0xF0) != (cfg.prefixBytes[full_bytes] & 0xF0)) return 0;
+        }
+        return n;
+    }
+    return score_lz(addr);
 }
 
 // Optimized Keccak-f[1600] for CPU with loop unrolling
@@ -130,8 +146,8 @@ void keccak_f1600_cpu(const State& input, State& output) {
     }
 }
 
-inline void cpu_mine(uint64_t base, int thread_id, const LaunchCfg& cfg, SharedData& shared) {
-    uint64_t salt_hi = (base + thread_id) << 52;
+inline void cpu_mine(uint64_t base, int thread_id, const LaunchCfg& cfg, SharedData& shared, uint32_t epoch) {
+    uint64_t salt_hi = ((base + thread_id) << 52) | uint64_t(epoch);
     uint64_t salt_lo = 0;
     uint64_t localCount = 0;
     State s{};
@@ -177,11 +193,11 @@ inline void cpu_mine(uint64_t base, int thread_id, const LaunchCfg& cfg, SharedD
 
             U160 addr;
             std::memcpy(addr.data(), reinterpret_cast<uint8_t*>(&final_res) + 12, 20);
-            sc = score_lz(addr);
+            sc = compute_score(addr, cfg);
         } else {
             U160 addr;
             std::memcpy(addr.data(), reinterpret_cast<uint8_t*>(&result) + 12, 20);
-            sc = score_lz(addr);
+            sc = compute_score(addr, cfg);
         }
 
         localCount++;
@@ -209,12 +225,15 @@ inline void cpu_mine(uint64_t base, int thread_id, const LaunchCfg& cfg, SharedD
 }
 
 void run_cpu_mining(const LaunchCfg& cfg, uint32_t num_threads, bool use_mpi, int rank, int size) {
+    uint32_t epoch = (uint32_t)time(nullptr);
+    std::cout << "[INFO] Epoch seed: " << epoch << "\n";
+
     SharedData shared(num_threads);
     std::vector<std::thread> threads;
     threads.reserve(num_threads);
 
     for (uint32_t i = 0; i < num_threads; ++i) {
-        threads.emplace_back(cpu_mine, /*base=*/i, /*thread_id=*/static_cast<int>(i), std::cref(cfg), std::ref(shared));
+        threads.emplace_back(cpu_mine, /*base=*/i, /*thread_id=*/static_cast<int>(i), std::cref(cfg), std::ref(shared), epoch);
     }
 
     auto t0 = std::chrono::high_resolution_clock::now();
