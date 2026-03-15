@@ -68,3 +68,11 @@ std::array<uint8_t,20> create2_address_gpu(const uint8_t deployer[20],
 std::array<uint8_t,20> create2_address_cpu(const uint8_t deployer[20],
                                            const uint8_t salt[32],
                                            const uint8_t initHash[32]);
+
+// CREATE3 address calc on CPU: two-step keccak (proxy via CREATE2, then RLP CREATE)
+std::array<uint8_t,20> create3_address_cpu(const uint8_t factory[20],
+                                           const uint8_t salt[32]);
+
+// CREATE3 address calc on GPU
+std::array<uint8_t,20> create3_address_gpu(const uint8_t factory[20],
+                                           const uint8_t salt[32]);

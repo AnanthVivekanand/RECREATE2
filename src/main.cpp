@@ -15,6 +15,8 @@ int main(int argc, char** argv)
     argparse::ArgumentParser p("create2_miner");
     p.add_argument("--deployer");
     p.add_argument("--init-hash");
+    p.add_argument("--create3").default_value(false).implicit_value(true)
+        .help("CREATE3 mode: deployer is the factory address, init-hash is ignored (uses Solady proxy hash)");
     p.add_argument("--score").default_value(0);   // leading‑zeros
     p.add_argument("--threshold").default_value(32).scan<'i',int>();
     p.add_argument("--threads").default_value(0).scan<'i',int>();
@@ -33,19 +35,33 @@ int main(int argc, char** argv)
         return 0;
     }
     
-    if (!p.present("--deployer") || !p.present("--init-hash")) {
-        std::cerr << "[ERR] --deployer and --init-hash are required in normal mode\n";
+    bool create3_mode = p.get<bool>("--create3");
+
+    if (!p.present("--deployer")) {
+        std::cerr << "[ERR] --deployer is required (factory address for CREATE3)\n";
         return 1;
     }
-    
+    if (!create3_mode && !p.present("--init-hash")) {
+        std::cerr << "[ERR] --init-hash is required in CREATE2 mode\n";
+        return 1;
+    }
+
     auto dep = hex_to_bytes<20>(p.get("--deployer"));
-    auto init = hex_to_bytes<32>(p.get("--init-hash"));
+    std::array<uint8_t,32> init{};
+    if (!create3_mode) {
+        init = hex_to_bytes<32>(p.get("--init-hash"));
+    }
 
     // single‑shot test mode
     if (p.present("--test-salt")) {
         auto salt = hex_to_bytes<32>(p.get("--test-salt"));
-        auto addr = create2_address_cpu(dep.data(), salt.data(), init.data());
-        std::cout << "0x" << to_hex(addr) << '\n';
+        if (create3_mode) {
+            auto addr = create3_address_cpu(dep.data(), salt.data());
+            std::cout << "0x" << to_hex(addr) << '\n';
+        } else {
+            auto addr = create2_address_cpu(dep.data(), salt.data(), init.data());
+            std::cout << "0x" << to_hex(addr) << '\n';
+        }
         return 0;
     }
 
@@ -56,6 +72,11 @@ int main(int argc, char** argv)
     cfg.deployer  = dep.data();
     cfg.initHash  = init.data();
     cfg.step      = 1;
+    cfg.create3   = create3_mode;
+
+    if (create3_mode) {
+        std::cout << "[INFO] CREATE3 mode enabled (Solady proxy hash)\n";
+    }
 
     bool use_mpi = p.get<bool>("--mpi");
     int rank = 0, size = 1;

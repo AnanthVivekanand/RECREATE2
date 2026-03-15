@@ -113,6 +113,100 @@ __global__ void mine(uint64_t start,
     }
 }
 
+// CREATE3 kernel: two keccaks per salt.
+// First keccak: CREATE2 proxy address (factory + salt + PROXY_INITCODE_HASH)
+// Second keccak: RLP-encoded CREATE (0xd694 || proxy || 0x01) -> final address
+__global__ void mine_create3(uint64_t start,
+                             uint64_t step,
+                             uint64_t target,
+                             int scoreMode,
+                             salt_result* out,
+                             uint64_t* perfCounters,
+                             uint32_t deviceIdx,
+                             volatile int* device_should_exit)
+{
+    uint32_t gid = blockIdx.x * blockDim.x + threadIdx.x;
+    uint64_t salt_hi = ((start + gid) << 32) | (uint64_t(deviceIdx) << 52);
+    uint64_t salt_lo = 0;
+    uint64_t localCount = 0;
+
+    if (gid % 1000 == 0) {
+        printf("[DBG-C3] thread %d, start=%llu, step=%llu, target=%llu\n",
+               gid, start, step, target);
+    }
+
+    State res{};
+    State base = load_template();  // CREATE2 template with proxy init code hash
+
+    // load high salt into template (bytes 21-52 = salt region, hi = bytes 37-44)
+    uint8_t* s8 = reinterpret_cast<uint8_t*>(&base);
+    for (int i = 0; i < 8; i++) {
+        s8[44 - i] = (salt_hi >> (8 * i)) & 0xff;
+    }
+
+    #pragma unroll 5
+    while (true) {
+        if (*device_should_exit != 0) break;
+
+        // Set salt_lo in template (bytes 45-52)
+        for (int i = 0; i < 8; i++) {
+            s8[52 - i] = (salt_lo >> (8 * i)) & 0xff;
+        }
+
+        // --- First keccak: compute proxy address via CREATE2 ---
+        keccak_f1600_unrolled(base, res);
+
+        // Extract proxy address (bytes 12-31 of keccak output) directly from lanes.
+        // In little-endian uint64_t layout:
+        //   proxy[0..3]  = upper 4 bytes of res[1]
+        //   proxy[4..11] = res[2]
+        //   proxy[12..19]= res[3]
+        uint64_t r1 = res[1], r2 = res[2], r3 = res[3];
+
+        // --- Build RLP state for second keccak ---
+        // RLP buffer: [0xd6, 0x94, proxy(20 bytes), 0x01] = 23 bytes
+        // Keccak padding: byte 23 = 0x01, byte 135 = 0x80
+        // Only lanes 0, 1, 2, 16 are non-zero.
+        State rlp{};
+        rlp[0]  = 0x94d6ULL | ((r1 >> 32) << 16) | ((r2 & 0xFFFFULL) << 48);
+        rlp[1]  = (r2 >> 16) | ((r3 & 0xFFFFULL) << 48);
+        rlp[2]  = (r3 >> 16) | (0x0101ULL << 48);
+        // lanes 3-15 are zero (already initialized)
+        rlp[16] = 0x8000000000000000ULL;  // padding end bit at byte 135
+        // lanes 17-24 are zero (already initialized)
+
+        // --- Second keccak: compute final CREATE3 address ---
+        keccak_f1600_unrolled(rlp, res);
+
+        localCount++;
+        if (localCount == LOG_INTERVAL) {
+            atomicAdd((unsigned long long*)&perfCounters[blockIdx.x],
+                      (unsigned long long)localCount);
+            localCount = 0;
+            if (*device_should_exit != 0) break;
+        }
+
+        if (score_lz(tail20bytes(res)) >= int32_t(target)) {
+            int32_t sc = score_lz(tail20bytes(res));
+            printf("[DBG-C3] thread %d, salt_lo=%016llx, salt_hi=%016llx, score=%d\n",
+                   gid, salt_lo, salt_hi, sc);
+            if (*device_should_exit == 0) {
+                out->score = sc;
+                out->salt_lo = salt_lo;
+                out->salt_hi = salt_hi;
+                *device_should_exit = 1;
+                break;
+            }
+        }
+        salt_lo += 1;
+    }
+
+    if (localCount) {
+        atomicAdd((unsigned long long*)&perfCounters[blockIdx.x],
+                  (unsigned long long)localCount);
+    }
+}
+
 void run_kernel(const LaunchCfg& cfg,
                 uint32_t blocks,
                 uint32_t threads,
@@ -133,8 +227,13 @@ void run_kernel(const LaunchCfg& cfg,
     uint64_t hostTpl[17] = {};
     uint8_t* ptr = reinterpret_cast<uint8_t*>(hostTpl);
     ptr[0] = 0xff;
-    cudaMemcpy(ptr + 1,    cfg.deployer, 20, cudaMemcpyHostToHost);
-    cudaMemcpy(ptr + 53,   cfg.initHash, 32, cudaMemcpyHostToHost);
+    memcpy(ptr + 1, cfg.deployer, 20);
+    if (cfg.create3) {
+        // CREATE3: use constant Solady proxy initcode hash
+        memcpy(ptr + 53, SOLADY_PROXY_INITCODE_HASH, 32);
+    } else {
+        memcpy(ptr + 53, cfg.initHash, 32);
+    }
     ptr[85]  = 0x01;
     ptr[135] = 0x80;
 
@@ -164,16 +263,18 @@ void run_kernel(const LaunchCfg& cfg,
         if (!threads) threads = 256;
         if (!blocks) {
             int maxPerSM;
+            void* kernel_fn = cfg.create3 ? (void*)mine_create3 : (void*)mine;
             err = cudaOccupancyMaxActiveBlocksPerMultiprocessor(
-                &maxPerSM, (void*)mine, threads, 0);
+                &maxPerSM, kernel_fn, threads, 0);
             if (err != cudaSuccess) {
                 std::cerr << "[ERR] Occupancy calculation failed for GPU " << i << ": "
                         << cudaGetErrorString(err) << "\n";
                 return;
             }
             blocks = maxPerSM * prop.multiProcessorCount;
-            printf("[INFO] GPU %d: maxPerSM=%d, multiProcessorCount=%d\n",
-                   i, maxPerSM, prop.multiProcessorCount);
+            printf("[INFO] GPU %d: maxPerSM=%d, multiProcessorCount=%d, mode=%s\n",
+                   i, maxPerSM, prop.multiProcessorCount,
+                   cfg.create3 ? "CREATE3" : "CREATE2");
         }
 
         cudaDeviceSetLimit(cudaLimitPrintfFifoSize, 10*1024*1024);
@@ -208,16 +309,17 @@ void run_kernel(const LaunchCfg& cfg,
                   << "," << threads << ">>> (" << uint64_t(blocks)*threads
                   << " threads)\n";
 
-        mine<<<blocks, threads, 0, ctx.stream>>>(
-            cfg.start,
-            cfg.step,
-            cfg.target,
-            cfg.scoreMode,
-            ctx.d_best,
-            ctx.d_perfCounters,
-            i,  // deviceIdx
-            ctx.d_should_exit
-        );
+        if (cfg.create3) {
+            mine_create3<<<blocks, threads, 0, ctx.stream>>>(
+                cfg.start, cfg.step, cfg.target, cfg.scoreMode,
+                ctx.d_best, ctx.d_perfCounters, i, ctx.d_should_exit
+            );
+        } else {
+            mine<<<blocks, threads, 0, ctx.stream>>>(
+                cfg.start, cfg.step, cfg.target, cfg.scoreMode,
+                ctx.d_best, ctx.d_perfCounters, i, ctx.d_should_exit
+            );
+        }
 
         err = cudaGetLastError();
         if (err != cudaSuccess) {
@@ -367,31 +469,48 @@ void run_kernel(const LaunchCfg& cfg,
         bestSaltHi >>= 8;
     }
     std::cout << "\n";
-    auto addr = create2_address_cpu(
-        cfg.deployer, saltArr.data(), cfg.initHash
-    );
-    auto addr_gpu = create2_address_gpu(
-        cfg.deployer, saltArr.data(), cfg.initHash
-    );
-    std::cout << "Address GPU: 0x" << to_hex(addr_gpu) << std::endl;
-    std::cout << "Address CPU: 0x" << to_hex(addr) << std::endl;
+    if (cfg.create3) {
+        auto addr = create3_address_cpu(cfg.deployer, saltArr.data());
+        auto addr_gpu = create3_address_gpu(cfg.deployer, saltArr.data());
+        std::cout << "CREATE3 Address GPU: 0x" << to_hex(addr_gpu) << std::endl;
+        std::cout << "CREATE3 Address CPU: 0x" << to_hex(addr) << std::endl;
+    } else {
+        auto addr = create2_address_cpu(cfg.deployer, saltArr.data(), cfg.initHash);
+        auto addr_gpu = create2_address_gpu(cfg.deployer, saltArr.data(), cfg.initHash);
+        std::cout << "Address GPU: 0x" << to_hex(addr_gpu) << std::endl;
+        std::cout << "Address CPU: 0x" << to_hex(addr) << std::endl;
+    }
 }
 
 __global__ void keccak_f1600_kernel(State* state) {
     keccak_f1600_unrolled(*state, *state);
 }
 
+// Two-pass keccak kernel for CREATE3: proxy address then RLP CREATE
+__global__ void keccak_create3_kernel(State* state) {
+    State res{};
+    keccak_f1600_unrolled(*state, res);
+
+    // Extract proxy address lanes
+    uint64_t r1 = res[1], r2 = res[2], r3 = res[3];
+
+    // Build RLP state
+    State rlp{};
+    rlp[0]  = 0x94d6ULL | ((r1 >> 32) << 16) | ((r2 & 0xFFFFULL) << 48);
+    rlp[1]  = (r2 >> 16) | ((r3 & 0xFFFFULL) << 48);
+    rlp[2]  = (r3 >> 16) | (0x0101ULL << 48);
+    rlp[16] = 0x8000000000000000ULL;
+
+    keccak_f1600_unrolled(rlp, *state);
+}
+
 std::array<uint8_t,20> create2_address_gpu(const uint8_t deployer[20],
                                            const uint8_t salt[32],
                                            const uint8_t initHash[32]) {
-    // print salt
     printf("salt: ");
-    for (int i = 0; i < 32; i++) {
-        printf("%02x", salt[i]);
-    }
+    for (int i = 0; i < 32; i++) printf("%02x", salt[i]);
     printf("\n");
 
-    // Host‐side mimic of device pipeline
     State s{};
     uint8_t buf[136] = {0};
     buf[0] = 0xff;
@@ -403,18 +522,47 @@ std::array<uint8_t,20> create2_address_gpu(const uint8_t deployer[20],
 
     uint64_t* s_ptr   = reinterpret_cast<uint64_t*>(s.data());
     const uint64_t* b = reinterpret_cast<const uint64_t*>(buf);
-    for (int i = 0; i < 17; i++) {
-        s_ptr[i] = b[i];
-    }
+    for (int i = 0; i < 17; i++) s_ptr[i] = b[i];
 
     State* d_state = nullptr;
     cudaMalloc(&d_state, sizeof(State));
     cudaMemcpy(d_state, &s, sizeof(State), cudaMemcpyHostToDevice);
-
-    // Single-thread, single-block launch is enough for one hash
     keccak_f1600_kernel<<<1, 1>>>(d_state);
     cudaDeviceSynchronize();
+    cudaMemcpy(&s, d_state, sizeof(State), cudaMemcpyDeviceToHost);
+    cudaFree(d_state);
 
+    std::array<uint8_t,20> out;
+    uint8_t* p = reinterpret_cast<uint8_t*>(s.data());
+    memcpy(out.data(), p + 12, 20);
+    return out;
+}
+
+std::array<uint8_t,20> create3_address_gpu(const uint8_t factory[20],
+                                           const uint8_t salt[32]) {
+    printf("salt: ");
+    for (int i = 0; i < 32; i++) printf("%02x", salt[i]);
+    printf("\n");
+
+    // Build CREATE2 template for proxy address
+    State s{};
+    uint8_t buf[136] = {0};
+    buf[0] = 0xff;
+    memcpy(buf + 1, factory, 20);
+    memcpy(buf + 21, salt,    32);
+    memcpy(buf + 53, SOLADY_PROXY_INITCODE_HASH, 32);
+    buf[85]  = 0x01;
+    buf[135] = 0x80;
+
+    uint64_t* s_ptr   = reinterpret_cast<uint64_t*>(s.data());
+    const uint64_t* b = reinterpret_cast<const uint64_t*>(buf);
+    for (int i = 0; i < 17; i++) s_ptr[i] = b[i];
+
+    State* d_state = nullptr;
+    cudaMalloc(&d_state, sizeof(State));
+    cudaMemcpy(d_state, &s, sizeof(State), cudaMemcpyHostToDevice);
+    keccak_create3_kernel<<<1, 1>>>(d_state);
+    cudaDeviceSynchronize();
     cudaMemcpy(&s, d_state, sizeof(State), cudaMemcpyDeviceToHost);
     cudaFree(d_state);
 

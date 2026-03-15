@@ -141,7 +141,11 @@ inline void cpu_mine(uint64_t base, int thread_id, const LaunchCfg& cfg, SharedD
     // Initialize template
     s8[0] = 0xff;
     std::memcpy(s8 + 1, cfg.deployer, 20);
-    std::memcpy(s8 + 53, cfg.initHash, 32);
+    if (cfg.create3) {
+        std::memcpy(s8 + 53, SOLADY_PROXY_INITCODE_HASH, 32);
+    } else {
+        std::memcpy(s8 + 53, cfg.initHash, 32);
+    }
     s8[85] = 0x01;
     s8[135] = 0x80;
 
@@ -157,9 +161,28 @@ inline void cpu_mine(uint64_t base, int thread_id, const LaunchCfg& cfg, SharedD
         }
 
         keccak_f1600_cpu(s, result);
-        U160 addr;
-        std::memcpy(addr.data(), reinterpret_cast<uint8_t*>(&result) + 12, 20);
-        int32_t sc = score_lz(addr);
+
+        int32_t sc;
+        if (cfg.create3) {
+            // Second keccak: RLP CREATE from proxy address
+            uint64_t r1 = result[1], r2 = result[2], r3 = result[3];
+            State rlp{};
+            rlp[0]  = 0x94d6ULL | ((r1 >> 32) << 16) | ((r2 & 0xFFFFULL) << 48);
+            rlp[1]  = (r2 >> 16) | ((r3 & 0xFFFFULL) << 48);
+            rlp[2]  = (r3 >> 16) | (0x0101ULL << 48);
+            rlp[16] = 0x8000000000000000ULL;
+
+            State final_res{};
+            keccak_f1600_cpu(rlp, final_res);
+
+            U160 addr;
+            std::memcpy(addr.data(), reinterpret_cast<uint8_t*>(&final_res) + 12, 20);
+            sc = score_lz(addr);
+        } else {
+            U160 addr;
+            std::memcpy(addr.data(), reinterpret_cast<uint8_t*>(&result) + 12, 20);
+            sc = score_lz(addr);
+        }
 
         localCount++;
         if (localCount == LOG_INTERVAL) {
@@ -274,7 +297,12 @@ void run_cpu_mining(const LaunchCfg& cfg, uint32_t num_threads, bool use_mpi, in
             saltArr[23 - i] = static_cast<uint8_t>(salt_hi & 0xff);
             salt_hi >>= 8;
         }
-        auto addr = create2_address_cpu(cfg.deployer, saltArr.data(), cfg.initHash);
-        std::cout << "Address: 0x" << to_hex(addr) << std::endl;
+        if (cfg.create3) {
+            auto addr = create3_address_cpu(cfg.deployer, saltArr.data());
+            std::cout << "CREATE3 Address: 0x" << to_hex(addr) << std::endl;
+        } else {
+            auto addr = create2_address_cpu(cfg.deployer, saltArr.data(), cfg.initHash);
+            std::cout << "Address: 0x" << to_hex(addr) << std::endl;
+        }
     }
 }
