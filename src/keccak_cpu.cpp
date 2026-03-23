@@ -6,10 +6,6 @@
 std::array<uint8_t,20> create2_address_cpu(const uint8_t deployer[20],
                                            const uint8_t salt[32],
                                            const uint8_t initHash[32]){
-    printf("salt: ");
-    for (int i = 0; i < 32; i++) printf("%02x", salt[i]);
-    printf("\n");
-
     State s{};
     uint8_t buf[136] = {0};
     buf[0] = 0xff;
@@ -33,10 +29,6 @@ std::array<uint8_t,20> create2_address_cpu(const uint8_t deployer[20],
 
 std::array<uint8_t,20> create3_address_cpu(const uint8_t factory[20],
                                            const uint8_t salt[32]) {
-    printf("salt: ");
-    for (int i = 0; i < 32; i++) printf("%02x", salt[i]);
-    printf("\n");
-
     // Step 1: compute proxy address via CREATE2
     State s{};
     uint8_t buf[136] = {0};

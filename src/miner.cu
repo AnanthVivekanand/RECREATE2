@@ -9,6 +9,7 @@
 #include <curand_kernel.h>
 #include <vector>
 #include <ctime>
+#include <csignal>
 
 #define LOG_INTERVAL 5000
 
@@ -230,6 +231,409 @@ __global__ void mine_create3(uint64_t start,
     if (localCount) {
         atomicAdd((unsigned long long*)&perfCounters[blockIdx.x],
                   (unsigned long long)localCount);
+    }
+}
+
+// ============================================================
+// Multi-target mining: constant memory, device helpers, kernel
+// ============================================================
+
+__constant__ TargetSpec d_targets[MAX_TARGETS];
+__constant__ uint32_t   d_num_targets;
+
+// Branchless zero-byte counting (Hacker's Delight, borrow-safe)
+__device__ __forceinline__
+int count_zero_bytes_u64(uint64_t v) {
+    uint64_t lo = (v & 0x7F7F7F7F7F7F7F7FULL) + 0x7F7F7F7F7F7F7F7FULL;
+    lo |= v | 0x7F7F7F7F7F7F7F7FULL;
+    return __popcll(~lo & 0x8080808080808080ULL);
+}
+
+__device__ __forceinline__
+int count_zero_bytes_u32(uint32_t v) {
+    uint32_t lo = (v & 0x7F7F7F7FU) + 0x7F7F7F7FU;
+    lo |= v | 0x7F7F7F7FU;
+    return __popc(~lo & 0x80808080U);
+}
+
+__device__ __forceinline__
+int count_zero_bytes_total(uint32_t w0, uint64_t w1, uint64_t w2) {
+    return count_zero_bytes_u32(w0) + count_zero_bytes_u64(w1) + count_zero_bytes_u64(w2);
+}
+
+// Leading-zero scoring on raw Keccak lanes using __clz intrinsics
+__device__ __forceinline__
+uint32_t score_lz_lanes(uint32_t w0, uint64_t w1) {
+    // w0 has addr[0] at LSB (LE). Byte-swap to get addr[0] at MSB for __clz.
+    uint32_t w0_be = __byte_perm(w0, 0, 0x0123);
+    int clz = __clz(w0_be);
+    if (clz < 32)
+        return (clz / 8) * 8 + (clz % 8 >= 4 ? 4 : 0);
+
+    // All 4 addr bytes in w0 are zero. Check w1 (addr bytes 4-11).
+    uint32_t w1_lo = (uint32_t)w1;
+    uint32_t w1_hi = (uint32_t)(w1 >> 32);
+    uint64_t w1_be = ((uint64_t)__byte_perm(w1_lo, 0, 0x0123) << 32)
+                   | (uint64_t)__byte_perm(w1_hi, 0, 0x0123);
+    int clz2 = __clzll(w1_be);
+    int total = 32 + clz2;
+    return (total / 8) * 8 + (total % 8 >= 4 ? 4 : 0);
+}
+
+// Check all targets against an address given as raw lane words.
+// Uses branchless word-level mask+compare for prefix matching.
+__device__ __forceinline__
+void check_targets(uint32_t w0, uint64_t w1, uint64_t w2,
+                   uint64_t salt_lo, uint64_t salt_hi,
+                   MultiResult* out)
+{
+    #pragma unroll
+    for (int t = 0; t < MAX_TARGETS; t++) {
+        if (t >= d_num_targets) break;
+        const TargetSpec& tgt = d_targets[t];
+
+        // Branchless prefix check (all masks are 0 for LZ targets → always true)
+        bool prefix_ok = ((w0 & tgt.mask0) == tgt.val0)
+                       & ((w1 & tgt.mask1) == tgt.val1)
+                       & ((w2 & tgt.mask2) == tgt.val2);
+
+        if (!prefix_ok) continue;
+
+        uint32_t score;
+        if (tgt.type == TGT_PREFIX) {
+            score = tgt.prefix_nibbles;
+        } else if (tgt.type == TGT_LEADING_ZEROS) {
+            score = score_lz_lanes(w0, w1);
+        } else { // TGT_PREFIX_PLUS_ZEROS
+            score = count_zero_bytes_total(w0, w1, w2);
+        }
+
+        if (score >= tgt.threshold && score > out->results[t].score) {
+            uint32_t prev = atomicMax(&out->results[t].score, score);
+            if (score > prev) {
+                out->results[t].salt_lo = salt_lo;
+                out->results[t].salt_hi = salt_hi;
+            }
+            if (tgt.type == TGT_PREFIX) {
+                atomicOr(&out->found_mask, 1u << t);
+            }
+        }
+    }
+}
+
+// Multi-target CREATE3 kernel
+__global__ void mine_create3_multi(uint64_t start,
+                                   MultiResult* out,
+                                   uint64_t* perfCounters,
+                                   uint32_t deviceIdx,
+                                   volatile int* device_should_exit)
+{
+    uint32_t gid = blockIdx.x * blockDim.x + threadIdx.x;
+    uint64_t salt_hi = ((start + gid) << 32) | (uint64_t(deviceIdx) << 52) | uint64_t(d_epoch);
+    uint64_t salt_lo = 0;
+    uint64_t localCount = 0;
+
+    State res{};
+    State base = load_template();
+
+    uint8_t* s8 = reinterpret_cast<uint8_t*>(&base);
+    for (int i = 0; i < 8; i++) {
+        s8[44 - i] = (salt_hi >> (8 * i)) & 0xff;
+    }
+
+    #pragma unroll 5
+    while (true) {
+        if (*device_should_exit != 0) break;
+
+        for (int i = 0; i < 8; i++) {
+            s8[52 - i] = (salt_lo >> (8 * i)) & 0xff;
+        }
+
+        // First keccak: proxy address via CREATE2
+        keccak_f1600_unrolled(base, res);
+
+        uint64_t r1 = res[1], r2 = res[2], r3 = res[3];
+
+        // Build RLP state for second keccak
+        State rlp{};
+        rlp[0]  = 0x94d6ULL | ((r1 >> 32) << 16) | ((r2 & 0xFFFFULL) << 48);
+        rlp[1]  = (r2 >> 16) | ((r3 & 0xFFFFULL) << 48);
+        rlp[2]  = (r3 >> 16) | (0x0101ULL << 48);
+        rlp[16] = 0x8000000000000000ULL;
+
+        // Second keccak: final CREATE3 address
+        keccak_f1600_unrolled(rlp, res);
+
+        // Extract address from raw lanes (no byte array needed)
+        uint32_t w0 = (uint32_t)(res[1] >> 32);
+        uint64_t w1 = res[2];
+        uint64_t w2 = res[3];
+
+        check_targets(w0, w1, w2, salt_lo, salt_hi, out);
+
+        localCount++;
+        if (localCount == LOG_INTERVAL) {
+            atomicAdd((unsigned long long*)&perfCounters[blockIdx.x],
+                      (unsigned long long)localCount);
+            localCount = 0;
+            if (*device_should_exit != 0) break;
+        }
+
+        salt_lo += 1;
+    }
+
+    if (localCount) {
+        atomicAdd((unsigned long long*)&perfCounters[blockIdx.x],
+                  (unsigned long long)localCount);
+    }
+}
+
+// SIGINT handling for multi-target mode
+static volatile sig_atomic_t g_sigint_received = 0;
+static void sigint_handler(int) { g_sigint_received = 1; }
+
+void run_kernel_multi(const LaunchCfg& cfg,
+                      uint32_t blocks,
+                      uint32_t threads)
+{
+    signal(SIGINT, sigint_handler);
+
+    int num_gpus;
+    cudaGetDeviceCount(&num_gpus);
+    if (num_gpus < 1) {
+        std::cerr << "[ERR] No CUDA-capable devices found.\n";
+        return;
+    }
+    std::cout << "[INFO] Detected " << num_gpus << " GPU(s).\n";
+    std::cout << "=== MULTI-TARGET CREATE3 MINING ===\n";
+    std::cout << "Targets: " << cfg.num_targets << "\n";
+    for (uint32_t t = 0; t < cfg.num_targets; t++) {
+        const auto& tgt = cfg.targets[t];
+        const char* type_str = tgt.type == TGT_PREFIX ? "prefix" :
+                               tgt.type == TGT_LEADING_ZEROS ? "leading_zeros" :
+                               "prefix+zeros";
+        std::printf("  [%d] %s (%s, %d nibbles, threshold=%u)\n",
+                    t, tgt.name, type_str, tgt.prefix_nibbles, tgt.threshold);
+    }
+
+    // Prepare CREATE3 template
+    uint64_t hostTpl[17] = {};
+    uint8_t* ptr = reinterpret_cast<uint8_t*>(hostTpl);
+    ptr[0] = 0xff;
+    memcpy(ptr + 1, cfg.deployer, 20);
+    memcpy(ptr + 53, SOLADY_PROXY_INITCODE_HASH, 32);
+    ptr[85]  = 0x01;
+    ptr[135] = 0x80;
+
+    uint32_t epoch = (uint32_t)time(nullptr);
+    std::cout << "[INFO] Epoch seed: " << epoch << "\n";
+
+    int should_exit = 0;
+
+    struct GPUContext {
+        cudaStream_t stream;
+        cudaStream_t copyStream;
+        MultiResult* d_result;
+        uint64_t* d_perfCounters;
+        uint64_t* h_perfCounters;
+        int* d_should_exit;
+    };
+    std::vector<GPUContext> contexts(num_gpus);
+
+    for (int i = 0; i < num_gpus; i++) {
+        cudaSetDevice(i);
+
+        cudaMemcpyToSymbol(template85, hostTpl, 136);
+        cudaMemcpyToSymbol(d_epoch, &epoch, sizeof(uint32_t));
+        cudaMemcpyToSymbol(d_targets, cfg.targets, sizeof(TargetSpec) * cfg.num_targets);
+        cudaMemcpyToSymbol(d_num_targets, &cfg.num_targets, sizeof(uint32_t));
+
+        cudaDeviceProp prop;
+        cudaGetDeviceProperties(&prop, i);
+        if (!threads) threads = 256;
+        if (!blocks) {
+            int maxPerSM;
+            cudaError_t err = cudaOccupancyMaxActiveBlocksPerMultiprocessor(
+                &maxPerSM, (void*)mine_create3_multi, threads, 0);
+            if (err != cudaSuccess) {
+                std::cerr << "[ERR] Occupancy calc failed: " << cudaGetErrorString(err) << "\n";
+                return;
+            }
+            blocks = maxPerSM * prop.multiProcessorCount;
+            std::printf("[INFO] GPU %d: maxPerSM=%d, SMs=%d\n",
+                        i, maxPerSM, prop.multiProcessorCount);
+        }
+
+        cudaDeviceSetLimit(cudaLimitPrintfFifoSize, 10*1024*1024);
+
+        GPUContext& ctx = contexts[i];
+        cudaStreamCreate(&ctx.stream);
+        cudaStreamCreateWithFlags(&ctx.copyStream, cudaStreamNonBlocking);
+
+        cudaMalloc(&ctx.d_result, sizeof(MultiResult));
+        cudaMemset(ctx.d_result, 0, sizeof(MultiResult));
+
+        cudaMalloc(&ctx.d_perfCounters, blocks * sizeof(uint64_t));
+        cudaMemset(ctx.d_perfCounters, 0, blocks * sizeof(uint64_t));
+
+        cudaHostAlloc(&ctx.h_perfCounters, blocks * sizeof(uint64_t),
+                      cudaHostAllocPortable);
+        memset(ctx.h_perfCounters, 0, blocks * sizeof(uint64_t));
+
+        cudaMalloc(&ctx.d_should_exit, sizeof(int));
+        cudaMemset(ctx.d_should_exit, 0, sizeof(int));
+
+        std::cout << "[INFO] GPU " << i << ": Launching mine_create3_multi<<<"
+                  << blocks << "," << threads << ">>> ("
+                  << uint64_t(blocks)*threads << " threads)\n";
+
+        mine_create3_multi<<<blocks, threads, 0, ctx.stream>>>(
+            cfg.start, ctx.d_result, ctx.d_perfCounters, i, ctx.d_should_exit
+        );
+
+        cudaError_t err = cudaGetLastError();
+        if (err != cudaSuccess) {
+            std::cerr << "[ERR] GPU " << i << " kernel launch failed: "
+                      << cudaGetErrorString(err) << "\n";
+        }
+    }
+
+    // Polling loop — runs until Ctrl+C
+    std::vector<uint64_t> lastTotals(num_gpus, 0);
+    std::vector<uint32_t> lastScores(cfg.num_targets, 0);
+    auto t0 = std::chrono::high_resolution_clock::now();
+
+    while (!should_exit) {
+        std::this_thread::sleep_for(std::chrono::seconds(2));
+
+        if (g_sigint_received) {
+            std::cout << "\n[INFO] SIGINT received, stopping...\n";
+            should_exit = 1;
+            break;
+        }
+
+        for (int i = 0; i < num_gpus; i++) {
+            cudaSetDevice(i);
+            GPUContext& ctx = contexts[i];
+
+            MultiResult host_result;
+            cudaMemcpyAsync(ctx.h_perfCounters, ctx.d_perfCounters,
+                            blocks * sizeof(uint64_t),
+                            cudaMemcpyDeviceToHost, ctx.copyStream);
+            cudaMemcpyAsync(&host_result, ctx.d_result, sizeof(MultiResult),
+                            cudaMemcpyDeviceToHost, ctx.copyStream);
+            cudaStreamSynchronize(ctx.copyStream);
+
+            uint64_t total = 0;
+            for (uint32_t b = 0; b < blocks; b++)
+                total += ctx.h_perfCounters[b];
+
+            auto t1 = std::chrono::high_resolution_clock::now();
+            double elapsed = std::chrono::duration<double>(t1 - t0).count();
+            double rate = double(total - lastTotals[i]) / elapsed;
+            std::printf("[PERF] GPU %d: %.1f M hashes/s\n", i, rate / 1e6);
+            lastTotals[i] = total;
+
+            // Print per-target updates with verified address
+            for (uint32_t t = 0; t < cfg.num_targets; t++) {
+                auto& r = host_result.results[t];
+                if (r.score > lastScores[t]) {
+                    const auto& tgt = cfg.targets[t];
+
+                    // Reconstruct salt and compute address for display
+                    std::array<uint8_t, 32> saltArr{};
+                    uint64_t slo = r.salt_lo, shi = r.salt_hi;
+                    for (int j = 0; j < 8; ++j) {
+                        saltArr[31 - j] = static_cast<uint8_t>(slo & 0xff); slo >>= 8;
+                        saltArr[23 - j] = static_cast<uint8_t>(shi & 0xff); shi >>= 8;
+                    }
+                    auto addr = create3_address_cpu(cfg.deployer, saltArr.data());
+
+                    if (tgt.type == TGT_LEADING_ZEROS) {
+                        std::printf("[TARGET %d] %s: NEW BEST lz_score=%u salt=0x%016llx%016llx\n",
+                                    t, tgt.name, r.score,
+                                    (unsigned long long)r.salt_hi,
+                                    (unsigned long long)r.salt_lo);
+                    } else {
+                        std::printf("[TARGET %d] %s: NEW BEST zero_bytes=%u salt=0x%016llx%016llx\n",
+                                    t, tgt.name, r.score,
+                                    (unsigned long long)r.salt_hi,
+                                    (unsigned long long)r.salt_lo);
+                    }
+                    std::cout << "     Address: 0x" << to_hex(addr) << "\n";
+
+                    lastScores[t] = r.score;
+                }
+            }
+        }
+        t0 = std::chrono::high_resolution_clock::now();
+    }
+
+    // Signal all GPUs to stop
+    should_exit = 1;
+    for (int i = 0; i < num_gpus; i++) {
+        cudaSetDevice(i);
+        GPUContext& ctx = contexts[i];
+        cudaMemcpyAsync(ctx.d_should_exit, &should_exit,
+                        sizeof(int), cudaMemcpyHostToDevice, ctx.copyStream);
+        cudaStreamSynchronize(ctx.copyStream);
+    }
+
+    // Collect final results across all GPUs
+    MultiResult final_result{};
+    for (int i = 0; i < num_gpus; i++) {
+        cudaSetDevice(i);
+        GPUContext& ctx = contexts[i];
+        cudaStreamSynchronize(ctx.stream);
+
+        MultiResult gpu_result;
+        cudaMemcpy(&gpu_result, ctx.d_result, sizeof(MultiResult), cudaMemcpyDeviceToHost);
+
+        for (uint32_t t = 0; t < cfg.num_targets; t++) {
+            if (gpu_result.results[t].score > final_result.results[t].score) {
+                final_result.results[t] = gpu_result.results[t];
+            }
+        }
+        final_result.found_mask |= gpu_result.found_mask;
+    }
+
+    // Print and verify final results
+    std::cout << "\n=== FINAL RESULTS ===\n";
+    for (uint32_t t = 0; t < cfg.num_targets; t++) {
+        auto& r = final_result.results[t];
+        const auto& tgt = cfg.targets[t];
+
+        if (r.score == 0) {
+            std::printf("[%d] %s: no result found\n", t, tgt.name);
+            continue;
+        }
+
+        // Reconstruct salt byte array for verification
+        std::array<uint8_t, 32> saltArr{};
+        uint64_t slo = r.salt_lo, shi = r.salt_hi;
+        for (int i = 0; i < 8; ++i) {
+            saltArr[31 - i] = static_cast<uint8_t>(slo & 0xff); slo >>= 8;
+            saltArr[23 - i] = static_cast<uint8_t>(shi & 0xff); shi >>= 8;
+        }
+
+        auto addr = create3_address_cpu(cfg.deployer, saltArr.data());
+        std::printf("[%d] %s: score=%u salt=0x%016llx%016llx\n",
+                    t, tgt.name, r.score,
+                    (unsigned long long)r.salt_hi,
+                    (unsigned long long)r.salt_lo);
+        std::cout << "     Address: 0x" << to_hex(addr) << "\n";
+    }
+
+    // Cleanup
+    for (int i = 0; i < num_gpus; i++) {
+        cudaSetDevice(i);
+        GPUContext& ctx = contexts[i];
+        cudaStreamDestroy(ctx.stream);
+        cudaStreamDestroy(ctx.copyStream);
+        cudaFree(ctx.d_result);
+        cudaFree(ctx.d_perfCounters);
+        cudaFreeHost(ctx.h_perfCounters);
+        cudaFree(ctx.d_should_exit);
     }
 }
 
@@ -540,10 +944,6 @@ __global__ void keccak_create3_kernel(State* state) {
 std::array<uint8_t,20> create2_address_gpu(const uint8_t deployer[20],
                                            const uint8_t salt[32],
                                            const uint8_t initHash[32]) {
-    printf("salt: ");
-    for (int i = 0; i < 32; i++) printf("%02x", salt[i]);
-    printf("\n");
-
     State s{};
     uint8_t buf[136] = {0};
     buf[0] = 0xff;
@@ -573,10 +973,6 @@ std::array<uint8_t,20> create2_address_gpu(const uint8_t deployer[20],
 
 std::array<uint8_t,20> create3_address_gpu(const uint8_t factory[20],
                                            const uint8_t salt[32]) {
-    printf("salt: ");
-    for (int i = 0; i < 32; i++) printf("%02x", salt[i]);
-    printf("\n");
-
     // Build CREATE2 template for proxy address
     State s{};
     uint8_t buf[136] = {0};

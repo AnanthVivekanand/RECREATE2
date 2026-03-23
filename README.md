@@ -5,7 +5,9 @@ RECREATE2 is a high-performance CUDA/MPI miner for Ethereum smart contract deplo
 ## Features
 
 - **CREATE2 and CREATE3**: Mine vanity addresses for both deployment methods. CREATE3 uses the Solady proxy initcode hash.
+- **Multi-target mining**: Mine for multiple address patterns simultaneously from a single JSON config. One Keccak computation per salt checks all targets with <1% overhead.
 - **Prefix mining**: Search for any hex prefix (e.g. `--prefix 0xC0FFEE`), not just leading zeros.
+- **Branchless target checking**: Word-level mask+compare for prefix matching, Hacker's Delight zero-byte detection with `__popcll`, and `__clz` intrinsics for leading-zero scoring — all operating directly on raw Keccak lane values.
 - **GPU-accelerated**: CUDA kernels with ~1.8B hashes/sec (CREATE2) and ~800M hashes/sec (CREATE3) on an RTX A6000.
 - **Distributed support**: Optional MPI for multi-node scaling.
 - **CPU fallback**: Runs on multicore CPUs if CUDA is unavailable.
@@ -23,14 +25,13 @@ RECREATE2 is a high-performance CUDA/MPI miner for Ethereum smart contract deplo
 ## Build
 
 ```sh
-mkdir build && cd build
-cmake .. -DCMAKE_BUILD_TYPE=Release
-make -j$(nproc)
+cmake -B build -DCMAKE_BUILD_TYPE=Release
+cmake --build build -j$(nproc)
 ```
 
 If `nvcc` is not on your PATH:
 ```sh
-cmake .. -DCMAKE_BUILD_TYPE=Release -DCMAKE_CUDA_COMPILER=/usr/local/cuda/bin/nvcc
+cmake -B build -DCMAKE_BUILD_TYPE=Release -DCMAKE_CUDA_COMPILER=/usr/local/cuda/bin/nvcc
 ```
 
 Targets:
@@ -38,6 +39,8 @@ Targets:
 - `tests`: unit tests
 
 ## Usage
+
+### Single-target mode
 
 ```sh
 ./create2_miner \
@@ -53,6 +56,53 @@ Targets:
   --benchmark                     # run 10-second benchmark
   --test-salt   0x<32-byte hex>   # single-shot address test
 ```
+
+### Multi-target mode
+
+Mine for multiple address patterns simultaneously using a JSON config file:
+
+```sh
+./create2_miner --config targets.json --device gpu
+```
+
+All targets must share the same CREATE3 factory. The kernel computes one address per salt and checks it against all targets with branchless word-level comparisons.
+
+**Config format** (`targets.json`):
+
+```json
+{
+    "factory": "0x<20-byte factory address>",
+    "targets": [
+        {
+            "name": "my-token",
+            "type": "prefix",
+            "prefix": "0xC0FFEE"
+        },
+        {
+            "name": "my-exchange",
+            "type": "prefix_plus_zeros",
+            "prefix": "0xBEEF",
+            "threshold": 3
+        },
+        {
+            "name": "my-factory",
+            "type": "leading_zeros",
+            "threshold": 16
+        }
+    ]
+}
+```
+
+**Target types:**
+
+| Type | Description | Score |
+|------|-------------|-------|
+| `prefix` | Exact hex prefix match | Number of matched nibbles (first match wins) |
+| `leading_zeros` | Maximize leading zero bytes | 8 per zero byte + 4 per zero nibble |
+| `prefix_plus_zeros` | Prefix must match, then maximize zero bytes anywhere | Count of `0x00` bytes in full 20-byte address |
+
+- `threshold`: minimum score to record a result. Defaults to `prefix_nibbles` for `prefix` type, `1` otherwise.
+- Mining runs until Ctrl+C. Results print as they improve.
 
 ### Examples
 
@@ -88,8 +138,9 @@ RTX A6000 (Ampere, sm_86):
 |------|-----------|
 | CREATE2 | ~1,830 M hashes/s |
 | CREATE3 | ~800 M hashes/s |
+| CREATE3 multi-target (5 targets) | ~800 M hashes/s |
 
-CREATE3 is roughly half the speed of CREATE2 due to two Keccak-f[1600] permutations per salt.
+CREATE3 is roughly half the speed of CREATE2 due to two Keccak-f[1600] permutations per salt. Multi-target adds <1% overhead since the target checks (~40 instructions) are negligible compared to the two Keccak permutations (~9,600 instructions).
 
 ## License
 

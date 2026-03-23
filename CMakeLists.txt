@@ -31,7 +31,12 @@ FetchContent_Declare(
   GIT_REPOSITORY https://github.com/p-ranav/argparse.git
   GIT_TAG        v2.9
 )
-FetchContent_MakeAvailable(argparse)
+FetchContent_Declare(
+  json
+  GIT_REPOSITORY https://github.com/nlohmann/json.git
+  GIT_TAG        v3.11.3
+)
+FetchContent_MakeAvailable(argparse json)
 
 set(CMAKE_CXX_STANDARD 20)
 
@@ -63,7 +68,7 @@ target_include_directories(core PUBLIC include)
 
 # Main executable
 add_executable(create2_miner src/main.cpp)
-target_link_libraries(create2_miner PRIVATE core argparse::argparse)
+target_link_libraries(create2_miner PRIVATE core argparse::argparse nlohmann_json::nlohmann_json)
 if (MPI_FOUND)
     target_link_libraries(create2_miner PRIVATE ${MPI_LIBRARIES})
 endif()

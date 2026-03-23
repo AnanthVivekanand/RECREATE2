@@ -3,6 +3,7 @@
 #include <array>
 #include <string>
 #include "keccak.hpp"
+#include "targets.hpp"
 
 #ifdef HAVE_MPI
 #include <mpi.h>
@@ -10,12 +11,6 @@
 
 using U160    = std::array<uint8_t,20>;
 using ScoreFn = int32_t(*)(const U160&);
-
-struct salt_result {
-    uint64_t salt_lo;
-    uint64_t salt_hi;
-    uint32_t score;
-};
 
 struct LaunchCfg {
     uint64_t    start     = 0;
@@ -27,6 +22,11 @@ struct LaunchCfg {
     bool        create3   = false;
     uint8_t     prefixBytes[20] = {};
     int         prefixNibbles   = 0;     // 0 = leading-zero scoring mode
+
+    // Multi-target mode
+    bool        multi_target = false;
+    uint32_t    num_targets  = 0;
+    TargetSpec  targets[MAX_TARGETS] = {};
 };
 
 // Solady CREATE3 proxy initcode hash (constant across all Solady factories)
@@ -56,9 +56,15 @@ __global__ void mine_create3(uint64_t start,
                              uint64_t* perfCounters,
                              uint32_t deviceIdx,
                              volatile int* host_should_exit);
+
+__global__ void mine_create3_multi(uint64_t start,
+                                   MultiResult* out,
+                                   uint64_t* perfCounters,
+                                   uint32_t deviceIdx,
+                                   volatile int* device_should_exit);
 #endif
 
-// Host‐side launcher
+// Host-side launchers
 #ifdef HAVE_CUDA
 void run_kernel(const LaunchCfg& cfg,
                 uint32_t blocks,
@@ -66,6 +72,10 @@ void run_kernel(const LaunchCfg& cfg,
                 bool use_mpi,
                 int rank,
                 int size);
+
+void run_kernel_multi(const LaunchCfg& cfg,
+                      uint32_t blocks,
+                      uint32_t threads);
 #endif
 
 void run_cpu_mining(const LaunchCfg& cfg,
@@ -73,3 +83,5 @@ void run_cpu_mining(const LaunchCfg& cfg,
                     bool use_mpi,
                     int rank,
                     int size);
+
+void run_cpu_mining_multi(const LaunchCfg& cfg, uint32_t num_threads);
