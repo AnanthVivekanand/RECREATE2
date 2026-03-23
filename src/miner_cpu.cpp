@@ -11,6 +11,7 @@
 #include "util.hpp"
 #include <ctime>
 #include <csignal>
+#include <fstream>
 
 #define LOG_INTERVAL 5000
 
@@ -465,6 +466,11 @@ void run_cpu_mining_multi(const LaunchCfg& cfg, uint32_t num_threads) {
                              std::cref(cfg), std::ref(shared), epoch);
     }
 
+    std::ofstream results_log("results.txt", std::ios::app);
+    if (!results_log.is_open()) {
+        std::cerr << "[WARN] Could not open results.txt for writing\n";
+    }
+
     auto t0 = std::chrono::high_resolution_clock::now();
     uint64_t prev_total = 0;
     std::vector<uint32_t> lastScores(cfg.num_targets, 0);
@@ -500,11 +506,17 @@ void run_cpu_mining_multi(const LaunchCfg& cfg, uint32_t num_threads) {
                 }
                 auto addr = create3_address_cpu(cfg.deployer, saltArr.data());
 
-                std::printf("[TARGET %d] %s: score=%u salt=0x%016llx%016llx\n",
-                            t, tgt.name, r.score,
-                            (unsigned long long)r.salt_hi,
-                            (unsigned long long)r.salt_lo);
-                std::cout << "     Address: 0x" << to_hex(addr) << "\n";
+                std::string line = "[TARGET " + std::to_string(t) + "] " + tgt.name
+                                 + ": score=" + std::to_string(r.score)
+                                 + " salt=0x" + to_hex(saltArr);
+                std::string addr_str = "     Address: 0x" + to_hex(addr);
+
+                std::cout << line << "\n" << addr_str << "\n";
+
+                if (results_log.is_open()) {
+                    results_log << line << "\n" << addr_str << "\n";
+                    results_log.flush();
+                }
                 lastScores[t] = r.score;
             }
         }
@@ -515,6 +527,7 @@ void run_cpu_mining_multi(const LaunchCfg& cfg, uint32_t num_threads) {
 
     // Final results with verification
     std::cout << "\n=== FINAL RESULTS ===\n";
+    if (results_log.is_open()) results_log << "\n=== FINAL RESULTS ===\n";
     for (uint32_t t = 0; t < cfg.num_targets; t++) {
         auto& r = shared.results[t];
         const auto& tgt = cfg.targets[t];
@@ -532,10 +545,16 @@ void run_cpu_mining_multi(const LaunchCfg& cfg, uint32_t num_threads) {
         }
 
         auto addr = create3_address_cpu(cfg.deployer, saltArr.data());
-        std::printf("[%d] %s: score=%u salt=0x%016llx%016llx\n",
-                    t, tgt.name, r.score,
-                    (unsigned long long)r.salt_hi,
-                    (unsigned long long)r.salt_lo);
-        std::cout << "     Address: 0x" << to_hex(addr) << "\n";
+        std::string line = "[" + std::to_string(t) + "] " + tgt.name
+                         + ": score=" + std::to_string(r.score)
+                         + " salt=0x" + to_hex(saltArr);
+        std::string addr_str = "     Address: 0x" + to_hex(addr);
+
+        std::cout << line << "\n" << addr_str << "\n";
+
+        if (results_log.is_open()) {
+            results_log << line << "\n" << addr_str << "\n";
+        }
     }
+    if (results_log.is_open()) results_log.flush();
 }
